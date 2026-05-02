@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-from playwright_stealth import Stealth
+from playwright_stealth import stealth_async
 from config import TARGET_URL, ALLOWED_CATEGORIES, MAX_HOLDS, DEBUG_MODE, MAX_RETRIES
 
 logger = logging.getLogger(__name__)
@@ -101,10 +101,8 @@ class BookingEngine:
                 )
                 await context.add_cookies(self.cookies)
 
-                stealth = Stealth()
-                await stealth.apply_stealth_async(context)
-
                 page = await context.new_page()
+                await stealth_async(page)  # playwright_stealth 1.0.6: per-page function
 
                 # Log console errors in debug mode
                 if DEBUG_MODE:
