@@ -1,11 +1,17 @@
-def parse_cookie_string(cookie_str):
+def parse_cookie_string(cookie_str: str) -> list:
     cookies = []
     for item in cookie_str.split(";"):
-        name, value = item.strip().split("=", 1)
-        cookies.append({
-            "name": name,
-            "value": value,
-            "domain": ".webook.com",
-            "path": "/"
-        })
+        item = item.strip()
+        if "=" not in item:
+            continue
+        name, value = item.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name:
+            cookies.append({
+                "name": name,
+                "value": value,
+                "domain": ".webook.com",
+                "path": "/"
+            })
     return cookies
