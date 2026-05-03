@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import subprocess
+import sys
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from playwright_stealth import stealth_async
 from config import TARGET_URL, ALLOWED_CATEGORIES, MAX_HOLDS, DEBUG_MODE, MAX_RETRIES
@@ -55,6 +57,34 @@ HOLD_BTN_SELECTORS = [
 SOLD_OUT_SIGNALS = ["sold-out", "soldout", "unavailable", "disabled", "مباعة", "نفذت"]
 
 
+async def _launch_chromium(p):
+    """
+    Launch Chromium, auto-installing it if the executable is missing.
+    This handles cases where `playwright install` didn't run before bot start.
+    """
+    args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+            "--disable-gpu", "--single-process"]
+    try:
+        return await p.chromium.launch(headless=True, args=args)
+    except Exception as e:
+        if "Executable doesn't exist" in str(e) or "executable" in str(e).lower():
+            logger.warning("Chromium not found — installing now (one-time, ~100MB)...")
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "playwright", "install", "chromium", "--with-deps",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"playwright install failed:\n{stderr.decode()[:300]}"
+                ) from e
+            logger.info("Chromium installed successfully — retrying launch")
+            return await p.chromium.launch(headless=True, args=args)
+        raise
+
+
+
 class BookingEngine:
     """
     Drives a Playwright browser session to:
@@ -90,10 +120,7 @@ class BookingEngine:
                 await self.notify(f"🔄 إعادة المحاولة {attempt}/{MAX_RETRIES}...")
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-                )
+                browser = await _launch_chromium(p)
                 context = await browser.new_context(
                     extra_http_headers=self.headers,
                     viewport={"width": 1280, "height": 800},
