@@ -72,13 +72,13 @@ async def set_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["waiting_cookies"] = True
         await update.message.reply_text(
             "🍪 *كيف ترسل الكوكيز؟*\n\n"
-            "*الطريقة الأسهل — Cookie\\-Editor:*\n"
-            "1\\. افتح webook\\.com وسجّل دخولك\n"
-            "2\\. افتح إضافة Cookie\\-Editor من المتصفح\n"
-            "3\\. اضغط زر التصدير ⬆️ \\(Export\\) في الأسفل\n"
-            "4\\. الصق النص هنا مباشرةً\n\n"
-            "_البوت يقبل JSON من Cookie\\-Editor أو صيغة name=value_",
-            parse_mode="MarkdownV2",
+            "*الطريقة الأسهل — Cookie-Editor:*\n"
+            "1. افتح webook.com وسجّل دخولك\n"
+            "2. افتح إضافة Cookie-Editor من المتصفح\n"
+            "3. اضغط زر التصدير ⬆️ (Export) في الأسفل\n"
+            "4. الصق النص هنا مباشرةً\n\n"
+            "_البوت يقبل JSON من Cookie-Editor أو صيغة name=value_",
+            parse_mode="Markdown",
         )
 
 
