@@ -10,7 +10,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from utils import parse_cookie_string, build_headers
+from utils import parse_cookie_input, build_headers, validate_cookies
 from queue_worker import queue, worker, is_user_active, queue_size
 from config import ALLOWED_CATEGORIES, MAX_HOLDS, WORKER_COUNT
 
@@ -71,10 +71,14 @@ async def set_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         context.user_data["waiting_cookies"] = True
         await update.message.reply_text(
-            "📋 *أرسل الكوكيز الآن:*\n\n"
-            "الصق الكوكيز كرسالة عادية، أو استخدم:\n"
-            "`/setcookies name1=val1; name2=val2`",
-            parse_mode="Markdown",
+            "🍪 *كيف ترسل الكوكيز؟*\n\n"
+            "*الطريقة الأسهل — Cookie\\-Editor:*\n"
+            "1\\. افتح webook\\.com وسجّل دخولك\n"
+            "2\\. افتح إضافة Cookie\\-Editor من المتصفح\n"
+            "3\\. اضغط زر التصدير ⬆️ \\(Export\\) في الأسفل\n"
+            "4\\. الصق النص هنا مباشرةً\n\n"
+            "_البوت يقبل JSON من Cookie\\-Editor أو صيغة name=value_",
+            parse_mode="MarkdownV2",
         )
 
 
@@ -88,12 +92,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _save_cookies(update, context, user_id: int, cookie_text: str):
     try:
-        cookies = parse_cookie_string(cookie_text)
+        cookies = parse_cookie_input(cookie_text)
         if not cookies:
             await update.message.reply_text(
-                "❌ لم أجد كوكيز صالحة.\n"
-                "تأكد أن الصيغة: `name1=value1; name2=value2`",
-                parse_mode="Markdown",
+                "❌ لم أجد كوكيز صالحة\n\nتأكد أنك ضغطت Export في Cookie-Editor وليس نسخة كوكي واحدة."
             )
             return
 
@@ -107,8 +109,14 @@ async def _save_cookies(update, context, user_id: int, cookie_text: str):
 
         context.user_data["waiting_cookies"] = False
 
+        is_valid, validation_msg = validate_cookies(cookies)
+        if not is_valid:
+            await update.message.reply_text(validation_msg)
+            return
+
         await update.message.reply_text(
-            f"✅ تم حفظ *{len(cookies)}* cookie بنجاح!\n\n"
+            f"✅ تم حفظ *{len(cookies)}* cookie بنجاح!\n"
+            f"{validation_msg}\n\n"
             f"الخطوة التالية:\n"
             f"• اختر فئاتك المفضلة بـ /setcategories\n"
             f"• أو ابدأ الحجز مباشرة بـ /book",
