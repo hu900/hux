@@ -72,15 +72,47 @@ async def set_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["waiting_cookies"] = True
         await update.message.reply_text(
             "🍪 *كيف ترسل الكوكيز؟*\n\n"
-            "*الطريقة الأسهل — Cookie-Editor:*\n"
+            "*الطريقة الأسهل — إرسال كملف:*\n"
             "1. افتح webook.com وسجّل دخولك\n"
-            "2. افتح إضافة Cookie-Editor من المتصفح\n"
-            "3. اضغط زر التصدير ⬆️ (Export) في الأسفل\n"
-            "4. الصق النص هنا مباشرةً\n\n"
-            "_البوت يقبل JSON من Cookie-Editor أو صيغة name=value_",
+            "2. افتح Cookie-Editor من المتصفح\n"
+            "3. اضغط Export ⬆️ ثم احفظه كملف .json\n"
+            "4. أرسل الملف هنا مباشرةً 📎\n\n"
+            "⚠️ *لا تلصق النص مباشرة* — Telegram يقطع الرسائل الطويلة",
             parse_mode="Markdown",
         )
 
+
+
+# ══════════════════════════════════════════════
+#  File upload handler — accepts .json cookie export
+# ══════════════════════════════════════════════
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Accepts a .json file exported from Cookie-Editor."""
+    doc = update.message.document
+    if not doc:
+        return
+
+    # Accept any .json file regardless of waiting state
+    fname = doc.file_name or ""
+    if not fname.lower().endswith(".json"):
+        if context.user_data.get("waiting_cookies"):
+            await update.message.reply_text(
+                "❌ أرسل ملف .json فقط (من Cookie-Editor Export)"
+            )
+        return
+
+    await update.message.reply_text("📥 جارٍ قراءة الملف...")
+
+    try:
+        file = await doc.get_file()
+        raw_bytes = await file.download_as_bytearray()
+        raw_text = raw_bytes.decode("utf-8")
+    except Exception as e:
+        await update.message.reply_text(f"❌ فشل تحميل الملف: {str(e)[:80]}")
+        return
+
+    user_id = update.effective_user.id
+    await _save_cookies(update, context, user_id, raw_text)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Catches plain text when bot is waiting for cookies."""
@@ -384,6 +416,7 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("myinfo", myinfo))
     app.add_handler(CallbackQueryHandler(category_callback, pattern=r"^cat_"))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("🤖 Bot started. Listening for updates...")
