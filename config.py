@@ -19,7 +19,7 @@ ALLOWED_CATEGORIES = [
     "C3 RIGHT", "C3 LEFT",
     "C4",
     "C5", "C7", "C8",
-    "BRONZE", "BRONZE 1", "BRONZE 2",
+    "BRONZE", "BRONZE 1", "BRONZE 2", "Bronze", "Silver",
 ]
 
 # ──────────────────────────────────────────────
