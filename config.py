@@ -6,7 +6,7 @@ import os
 # ──────────────────────────────────────────────
 TARGET_URL = os.getenv(
     "TARGET_URL",
-    "https://webook.com/ar/events/YOUR_EVENT_SLUG"
+    "https://webook.com/ar/sa/ruh/music-events/events/abdulaziz-aldhuwaihi-vocally-1/book"
 )
 
 # ──────────────────────────────────────────────
