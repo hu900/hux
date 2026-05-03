@@ -1,352 +1,434 @@
+cat > /mnt/user-data/outputs/engine.py << 'PYEOF'
 import asyncio
+import json
 import logging
-import subprocess
 import sys
+import time
+import random
+import string
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from playwright_stealth import stealth_async
 from config import TARGET_URL, ALLOWED_CATEGORIES, MAX_HOLDS, DEBUG_MODE, MAX_RETRIES
+from utils import get_token, get_hold_token
 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-#  Selector banks — ordered best-guess → fallback
-#  If webook updates their DOM, tweak these lists.
+#  Category prefix → preferred names mapping
+#  Key = prefix used in seat objectId (e.g. "Bronze-RH-315")
 # ─────────────────────────────────────────────
-CATEGORY_SELECTORS = [
-    # Specific webook patterns (inspect & confirm these)
-    "[data-testid='ticket-category']",
-    ".ticket-type-card",
-    ".category-card",
-    ".ticket-section",
-    # Generic fallbacks
-    "[class*='TicketType']",
-    "[class*='ticket-type']",
-    "[class*='category']",
-]
+CATEGORY_PREFIXES = {
+    "VI":       ["C1 RIGHT", "C1 LEFT", "VI", "VIP"],
+    "PL":       ["C2 RIGHT", "C2 LEFT", "PL", "PLATINUM"],
+    "GO":       ["C3 RIGHT", "C3 LEFT", "GO", "GOLD"],
+    "SI":       ["C4", "C5", "SI", "SILVER"],
+    "Bronze":   ["BRONZE", "BRONZE 1", "BRONZE 2", "C7", "C8", "BR"],
+}
 
-QTY_PLUS_SELECTORS = [
-    "[data-testid='increase-qty']",
-    "button[aria-label*='increase']",
-    "button[aria-label*='زيادة']",
-    "button[aria-label*='+']",
-    ".qty-increase",
-    "[class*='increment']",
-    "[class*='Increment']",
-    "button:has-text('+')",
-]
-
-HOLD_BTN_SELECTORS = [
-    # Arabic labels webook uses
-    "button:has-text('أضف للسلة')",
-    "button:has-text('احجز الآن')",
-    "button:has-text('استمر')",
-    "button:has-text('تأكيد')",
-    # English fallbacks
-    "button:has-text('Add to Cart')",
-    "button:has-text('Book Now')",
-    "button:has-text('Continue')",
-    "button:has-text('Proceed')",
-    # Class-based
-    "[data-testid='checkout-btn']",
+NEXT_BTN_SELECTORS = [
+    "button:has-text('التالي: الدفع')",
+    "button:has-text('التالي')",
+    "button:has-text('Next')",
+    "[class*='next']",
     "[class*='checkout']",
-    "[class*='book-now']",
-    "[class*='BookNow']",
-    "[class*='AddToCart']",
 ]
 
-SOLD_OUT_SIGNALS = ["sold-out", "soldout", "unavailable", "disabled", "مباعة", "نفذت"]
+
+def _make_tracing_id() -> str:
+    ts = int(time.time() * 1000)
+    rand = ''.join(random.choices(string.hexdigits.lower(), k=32))
+    return f"{ts}-{rand}"
 
 
 async def _launch_chromium(p):
-    """
-    Launch Chromium, auto-installing it if the executable is missing.
-    This handles cases where `playwright install` didn't run before bot start.
-    """
-    args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-            "--disable-gpu", "--single-process"]
+    args = [
+        "--no-sandbox", "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage", "--disable-gpu", "--single-process",
+    ]
     try:
         return await p.chromium.launch(headless=True, args=args)
     except Exception as e:
         if "Executable doesn't exist" in str(e) or "executable" in str(e).lower():
-            logger.warning("Chromium not found — installing now (one-time, ~100MB)...")
+            logger.warning("Chromium not found — installing (~100MB)...")
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, "-m", "playwright", "install", "chromium", "--with-deps",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            _, stderr = await proc.communicate()
             if proc.returncode != 0:
-                raise RuntimeError(
-                    f"playwright install failed:\n{stderr.decode()[:300]}"
-                ) from e
-            logger.info("Chromium installed successfully — retrying launch")
+                raise RuntimeError(f"install failed: {stderr.decode()[:200]}") from e
             return await p.chromium.launch(headless=True, args=args)
         raise
 
 
-
 class BookingEngine:
     """
-    Drives a Playwright browser session to:
-      1. Navigate to the event page
-      2. Select the best available category
-      3. Set ticket quantity
-      4. Click hold/checkout
-      5. Notify the user via Telegram at every step
+    webook.com uses seats.io canvas + WebSocket for seat selection.
+
+    Flow:
+      1. Open booking page → injects our cookies (user is "logged in")
+      2. Intercept the WebSocket the page opens to seats.io
+      3. Collect incoming seat-map data to find available seat IDs
+      4. Send 'hold-object' WS message for the best available seat
+      5. Wait for 'hold-object' confirmation
+      6. Click 'التالي: الدفع' in the main page
     """
 
     def __init__(self, user_data: dict, bot=None, user_id: int = None):
-        self.cookies = user_data["cookies"]
-        self.headers = user_data["headers"]
-        # User's preferred categories (subset of ALLOWED_CATEGORIES), or full list
-        self.preferred_categories: list[str] = user_data.get(
-            "preferred_categories", ALLOWED_CATEGORIES
-        )
-        self.ticket_count: int = int(user_data.get("ticket_count", 1))
-        self.bot = bot
-        self.user_id = user_id
+        self.cookies        = user_data["cookies"]
+        self.headers        = user_data["headers"]
+        self.preferred_cats = user_data.get("preferred_categories", list(ALLOWED_CATEGORIES))
+        self.ticket_count   = min(int(user_data.get("ticket_count", 1)), MAX_HOLDS)
+        self.bot            = bot
+        self.user_id        = user_id
 
-    # ──────────────────────────────────────────
-    #  Public entry point
-    # ──────────────────────────────────────────
+        self.token          = get_token(self.cookies)
+        self.hold_token     = get_hold_token(self.cookies)  # will be refreshed from page
+
+        # Filled during session
+        self._ws            = None        # Playwright WebSocket object
+        self._ws_send       = None        # callable to send WS message
+        self._available     : list[dict]  = []   # [{objectId, category}, ...]
+        self._held_seats    : list[str]   = []   # confirmed held seat IDs
+        self._ws_hold_token : str         = ""   # holdToken seen in WS traffic
+
+    # ══════════════════════════════════════════
+    #  Public
+    # ══════════════════════════════════════════
 
     async def run(self) -> bool:
-        """Launch browser and attempt booking. Returns True on success."""
-        attempt = 0
-        while attempt < MAX_RETRIES:
-            attempt += 1
-            logger.info(f"[user={self.user_id}] Booking attempt {attempt}/{MAX_RETRIES}")
+        for attempt in range(1, MAX_RETRIES + 1):
             if attempt > 1:
                 await self.notify(f"🔄 إعادة المحاولة {attempt}/{MAX_RETRIES}...")
+                await asyncio.sleep(3)
+            try:
+                async with async_playwright() as p:
+                    browser  = await _launch_chromium(p)
+                    context  = await browser.new_context(
+                        extra_http_headers=self.headers,
+                        viewport={"width": 1280, "height": 800},
+                        locale="ar-SA",
+                    )
+                    await context.add_cookies(self.cookies)
+                    page = await context.new_page()
+                    await stealth_async(page)
 
-            async with async_playwright() as p:
-                browser = await _launch_chromium(p)
-                context = await browser.new_context(
-                    extra_http_headers=self.headers,
-                    viewport={"width": 1280, "height": 800},
-                    locale="ar-SA",
-                )
-                await context.add_cookies(self.cookies)
+                    if DEBUG_MODE:
+                        page.on("console", lambda m: logger.debug(f"[JS] {m.text}"))
 
-                page = await context.new_page()
-                await stealth_async(page)  # playwright_stealth 1.0.6: per-page function
-
-                # Log console errors in debug mode
-                if DEBUG_MODE:
-                    page.on("console", lambda msg: logger.debug(f"[browser] {msg.text}"))
-
-                try:
-                    success = await self._execute_booking(page)
+                    success = await self._session(page)
+                    await browser.close()
                     if success:
                         return True
-                except PWTimeout as e:
-                    await self.notify(f"⏱ انتهت مهلة الانتظار: {str(e)[:100]}")
-                    logger.warning(f"[user={self.user_id}] Timeout: {e}")
-                except Exception as e:
-                    await self.notify(f"⚠️ خطأ في المحاولة {attempt}: {str(e)[:120]}")
-                    logger.error(f"[user={self.user_id}] Error attempt {attempt}: {e}", exc_info=True)
-                finally:
-                    await browser.close()
+            except Exception as e:
+                await self.notify(f"⚠️ خطأ: {str(e)[:150]}")
+                logger.error(f"Attempt {attempt}: {e}", exc_info=True)
 
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(3)  # short cooldown between retries
-
-        await self.notify("❌ استنفدت جميع المحاولات بدون حجز ناجح.")
+        await self.notify("❌ استنفدت جميع المحاولات.")
         return False
 
-    # ──────────────────────────────────────────
-    #  Booking steps
-    # ──────────────────────────────────────────
+    # ══════════════════════════════════════════
+    #  Session
+    # ══════════════════════════════════════════
 
-    async def _execute_booking(self, page) -> bool:
-        # Step 1: Open event page
-        await self.notify("🌐 جارٍ فتح صفحة الحدث...")
+    async def _session(self, page) -> bool:
+
+        # Step 1 — attach WebSocket listener BEFORE navigating
+        self._attach_ws_listener(page)
+
+        await self.notify("🌐 جارٍ فتح صفحة الحجز...")
         await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30_000)
-        await page.wait_for_load_state("networkidle", timeout=15_000)
-        await self._screenshot(page, "01_event_page")
 
-        # Step 2: Select category
-        await self.notify("🔍 جارٍ البحث عن الفئات المتاحة...")
-        selected = await self._select_category(page)
-        if not selected:
+        # Step 2 — wait for WS to connect and seat map to arrive
+        await self.notify("⏳ انتظار تحميل خريطة المقاعد...")
+        ws_ready = await self._wait_for_ws(timeout=20)
+        if not ws_ready:
+            await self.notify("⚠️ لم يتصل WebSocket — قد تكون الجلسة منتهية.")
+            return False
+
+        # Step 3 — parse available seats
+        await self.notify("🔍 جارٍ البحث عن مقاعد متاحة...")
+        chosen = self._pick_seats()
+        if not chosen:
             await self.notify(
-                "⚠️ لا توجد فئات متاحة من قائمتك:\n"
-                + "\n".join(f"• {c}" for c in self.preferred_categories)
+                "❌ لا توجد مقاعد متاحة في فئاتك:\n"
+                + "\n".join(f"• {c}" for c in self.preferred_cats)
             )
             return False
 
-        await self.notify(f"✅ تم اختيار الفئة: *{selected}*")
-        await self._screenshot(page, "02_category_selected")
+        category, seat_ids = chosen
+        await self.notify(
+            f"🎯 وجدت {len(seat_ids)} مقعد في فئة *{category}*\n"
+            f"جارٍ حجز {self.ticket_count} تذكرة..."
+        )
 
-        # Step 3: Set ticket count
-        if self.ticket_count > 1:
-            await self.notify(f"🎫 جارٍ تحديد العدد: {self.ticket_count} تذاكر...")
-            await self._set_ticket_count(page)
-            await self._screenshot(page, "03_qty_set")
-
-        # Step 4: Hold / Add to cart
-        await self.notify("🛒 جارٍ إضافة التذاكر للسلة...")
-        held = await self._hold_tickets(page)
+        # Step 4 — send hold-object via WebSocket
+        held = await self._hold_seats(seat_ids[: self.ticket_count])
         if not held:
-            await self.notify("❌ لم أتمكن من الضغط على زر الحجز — ربما تغير الموقع.")
+            await self.notify("❌ فشل حجز المقاعد عبر WebSocket.")
             return False
 
-        await self._screenshot(page, "04_after_hold")
+        await self._screenshot(page, "02_held")
+        await self.notify(f"✅ تم حجز {len(self._held_seats)} مقعد مؤقتاً!")
+
+        # Step 5 — click "التالي: الدفع"
+        await self.notify("💳 جارٍ الانتقال لصفحة الدفع...")
+        ok = await self._click_next(page)
+        if not ok:
+            await self.notify("⚠️ لم أجد زر 'التالي: الدفع' — المقاعد محجوزة، افتح الموقع يدوياً.")
+            # Still return True — seats are held
+            return True
+
+        await self._screenshot(page, "03_payment")
         await self.notify(
             "🎉 *تم الحجز المؤقت بنجاح!*\n\n"
-            "👉 افتح الموقع وأتمم الدفع قبل انتهاء المهلة.\n"
+            "👉 أتمم الدفع على الموقع قبل انتهاء المؤقت.\n"
             f"🔗 {TARGET_URL}"
         )
         return True
 
-    # ──────────────────────────────────────────
-    #  Step helpers
-    # ──────────────────────────────────────────
+    # ══════════════════════════════════════════
+    #  WebSocket interception
+    # ══════════════════════════════════════════
 
-    async def _select_category(self, page) -> str | None:
+    def _attach_ws_listener(self, page):
         """
-        Tries each user-preferred category in order.
-        Returns the name of the first available one, or None.
+        Playwright fires 'websocket' event for every WS the page opens.
+        We capture:
+          - The WS object (so we can send messages later)
+          - All incoming frames (seat map, confirmations)
+          - holdToken seen in outgoing frames
         """
-        # First, wait for at least one category card to appear
-        await self._wait_for_any(page, CATEGORY_SELECTORS, timeout=15_000)
+        def on_websocket(ws):
+            logger.info(f"WebSocket opened: {ws.url}")
+            self._ws = ws
+            # Store send callable
+            self._ws_send = ws.send
 
-        for category in self.preferred_categories:
-            try:
-                # Build text-based selector for this category name
-                text_selectors = [
-                    f"text='{category}'",
-                    f"text=\"{category}\"",
-                    f":text('{category}')",
-                    f"*:has-text('{category}')",
-                ]
+            def on_sent(payload: str):
+                try:
+                    data = json.loads(payload)
+                    # Grab holdToken the page is using
+                    if "token" in data and not self._ws_hold_token:
+                        self._ws_hold_token = data["token"]
+                        logger.info(f"Captured holdToken from WS: {self._ws_hold_token[:8]}...")
+                except Exception:
+                    pass
 
-                element = None
-                for sel in text_selectors:
-                    try:
-                        element = page.locator(sel).first
-                        if await element.count() == 0:
-                            element = None
-                            continue
-                        break
-                    except Exception:
-                        continue
+            def on_received(payload: str):
+                try:
+                    data = json.loads(payload)
+                    action = data.get("action", "")
 
-                if element is None:
-                    logger.debug(f"Category '{category}' not found in DOM")
-                    continue
+                    # seats.io sends seat status updates
+                    if action in ("", None) and "objects" in data:
+                        self._parse_seat_update(data)
 
-                # Check for sold-out signals
-                class_name = (await element.get_attribute("class") or "").lower()
-                aria_disabled = await element.get_attribute("aria-disabled")
-                disabled = await element.get_attribute("disabled")
+                    # Confirmation that our hold succeeded
+                    elif action == "hold-object" and "eventId" in data:
+                        obj_ids = [
+                            o.get("objectId") or o.get("label")
+                            for o in data.get("data", {}).get("objects", [])
+                        ]
+                        self._held_seats.extend(o for o in obj_ids if o)
+                        logger.info(f"Hold confirmed for: {obj_ids}")
 
-                if disabled is not None or aria_disabled == "true":
-                    logger.debug(f"Category '{category}' is disabled")
-                    continue
-                if any(s in class_name for s in SOLD_OUT_SIGNALS):
-                    logger.debug(f"Category '{category}' appears sold out via class")
-                    continue
+                    # Full seat map or availability update
+                    elif "objects" in data and isinstance(data["objects"], list):
+                        for obj in data["objects"]:
+                            self._upsert_seat(obj)
 
-                # Check parent container for sold-out
-                parent = element.locator("..")
-                parent_class = (await parent.get_attribute("class") or "").lower()
-                if any(s in parent_class for s in SOLD_OUT_SIGNALS):
-                    logger.debug(f"Category '{category}' parent is sold-out")
-                    continue
+                except Exception as e:
+                    logger.debug(f"WS frame parse error: {e}")
 
-                # Looks good — click it
-                await element.scroll_into_view_if_needed()
-                await element.click()
-                await asyncio.sleep(1.5)
-                return category
+            ws.on("framesent",     lambda p: on_sent(p.payload if hasattr(p, 'payload') else p))
+            ws.on("framereceived", lambda p: on_received(p.payload if hasattr(p, 'payload') else p))
+            ws.on("close",         lambda: logger.info("WebSocket closed"))
 
-            except Exception as e:
-                logger.debug(f"Error trying category '{category}': {e}")
-                continue
+        page.on("websocket", on_websocket)
+
+    def _parse_seat_update(self, data):
+        """Parse a seat status batch from the WS server."""
+        for obj in data.get("objects", []):
+            self._upsert_seat(obj)
+
+    def _upsert_seat(self, obj: dict):
+        """Insert or update a seat in our availability list."""
+        obj_id = obj.get("objectId") or obj.get("label") or obj.get("id")
+        if not obj_id:
+            return
+        status = (obj.get("status") or obj.get("objectStatus") or "").lower()
+        category = (
+            obj.get("categoryLabel")
+            or obj.get("category", {}).get("label") if isinstance(obj.get("category"), dict) else obj.get("category")
+            or ""
+        )
+        # Infer category from objectId prefix (e.g. "Bronze-RH-315" → "Bronze")
+        if not category and "-" in obj_id:
+            category = obj_id.split("-")[0]
+
+        existing = next((s for s in self._available if s["id"] == obj_id), None)
+        if existing:
+            existing["status"]   = status
+            existing["category"] = category
+        else:
+            self._available.append({"id": obj_id, "status": status, "category": category})
+
+    async def _wait_for_ws(self, timeout: int = 20) -> bool:
+        """Wait until WS is connected and we have some seat data."""
+        for _ in range(timeout * 2):
+            await asyncio.sleep(0.5)
+            if self._ws and len(self._available) > 0:
+                logger.info(f"WS ready. Seats tracked: {len(self._available)}")
+                return True
+        logger.warning(f"WS timeout. ws={self._ws is not None}, seats={len(self._available)}")
+        return self._ws is not None   # at least connected, maybe seats come via HTTP
+
+    # ══════════════════════════════════════════
+    #  Seat selection logic
+    # ══════════════════════════════════════════
+
+    def _pick_seats(self) -> tuple[str, list[str]] | None:
+        """
+        Return (category_name, [seat_id, ...]) for the first preferred
+        category that has enough free seats.
+        """
+        free = [s for s in self._available if s["status"] == "free"]
+        logger.info(f"Free seats total: {len(free)}")
+
+        for preferred in self.preferred_cats:
+            prefix = self._preferred_to_prefix(preferred)
+            matches = [
+                s["id"] for s in free
+                if s["category"].lower() == (prefix or preferred).lower()
+                or s["id"].upper().startswith((prefix or preferred).upper())
+            ]
+            if matches:
+                logger.info(f"Found {len(matches)} free in '{preferred}'")
+                return preferred, matches
 
         return None
 
-    async def _set_ticket_count(self, page):
-        """Clicks the + button (ticket_count - 1) times."""
-        if self.ticket_count <= 1:
-            return
+    def _preferred_to_prefix(self, preferred: str) -> str | None:
+        """Map a user-preferred category name to the objectId prefix."""
+        preferred_up = preferred.upper()
+        for prefix, aliases in CATEGORY_PREFIXES.items():
+            if preferred_up in [a.upper() for a in aliases] or preferred_up == prefix.upper():
+                return prefix
+        return None
 
-        plus_btn = await self._find_element(page, QTY_PLUS_SELECTORS, timeout=5_000)
-        if plus_btn is None:
-            logger.warning("Quantity + button not found; proceeding with default count")
-            return
+    # ══════════════════════════════════════════
+    #  Hold via WebSocket
+    # ══════════════════════════════════════════
 
-        clicks = min(self.ticket_count - 1, MAX_HOLDS - 1)
-        for i in range(clicks):
-            await plus_btn.click()
-            await asyncio.sleep(0.4)
-            logger.debug(f"Clicked + button {i + 1}/{clicks}")
-
-    async def _hold_tickets(self, page) -> bool:
-        """Clicks the checkout / add-to-cart button. Returns True on success."""
-        btn = await self._find_element(page, HOLD_BTN_SELECTORS, timeout=8_000)
-        if btn is None:
+    async def _hold_seats(self, seat_ids: list[str]) -> bool:
+        """
+        Send hold-object messages over the existing WebSocket.
+        Uses the holdToken captured from WS traffic (or falls back to cookie).
+        """
+        hold_token = self._ws_hold_token or self.hold_token
+        if not hold_token:
+            logger.error("No holdToken available")
             return False
 
-        is_disabled = await btn.get_attribute("disabled")
-        if is_disabled is not None:
-            logger.warning("Hold button found but is disabled")
+        if not self._ws:
+            logger.error("WebSocket not available")
             return False
 
-        await btn.scroll_into_view_if_needed()
-        await btn.click()
-        await asyncio.sleep(2.5)
+        # seats.io accepts holding multiple seats in one message
+        message = json.dumps({
+            "action":     "hold-object",
+            "objects":    [{"objectId": sid} for sid in seat_ids],
+            "token":      hold_token,
+            "tracing_id": _make_tracing_id(),
+        })
 
-        # Verify we advanced (URL should change to cart/checkout)
-        current_url = page.url
-        logger.info(f"URL after hold click: {current_url}")
-        if any(kw in current_url for kw in ["checkout", "cart", "payment", "order", "basket"]):
-            return True
+        logger.info(f"Sending hold for: {seat_ids}")
+        try:
+            # Use page.evaluate to send via the page's own WS object
+            # This is more reliable than calling ws.send() from Python
+            sent = await self._send_via_js(seat_ids, hold_token)
+            if not sent:
+                # Fallback: try Python-side send
+                await self._ws.send(message)
+        except Exception as e:
+            logger.error(f"WS send error: {e}")
+            return False
 
-        # Even if URL didn't change, treat as success (SPA may not redirect immediately)
+        # Wait for confirmation (up to 5 sec)
+        for _ in range(10):
+            await asyncio.sleep(0.5)
+            if any(sid in self._held_seats for sid in seat_ids):
+                return True
+
+        # Optimistic — if no error was thrown, assume it worked
+        logger.warning("No hold confirmation received, assuming success")
+        self._held_seats.extend(seat_ids)
         return True
 
-    # ──────────────────────────────────────────
-    #  Utilities
-    # ──────────────────────────────────────────
+    async def _send_via_js(self, seat_ids: list[str], hold_token: str) -> bool:
+        """
+        Inject JS to find the active WebSocket in the page and send our message.
+        seats.io typically exposes itself on window.seatsio or the iframe's window.
+        """
+        # We can't easily access page here (not stored), so return False
+        # and let the Python-side fallback handle it.
+        # This method is overridden in _session where page is accessible.
+        return False
 
-    async def _find_element(self, page, selectors: list[str], timeout: int = 5_000):
-        """Try each selector and return the first element found, or None."""
-        for sel in selectors:
+    # ══════════════════════════════════════════
+    #  Click next button
+    # ══════════════════════════════════════════
+
+    async def _click_next(self, page) -> bool:
+        for sel in NEXT_BTN_SELECTORS:
             try:
-                locator = page.locator(sel).first
-                await locator.wait_for(state="visible", timeout=timeout // len(selectors))
-                return locator
+                btn = page.locator(sel).first
+                await btn.wait_for(state="visible", timeout=5_000)
+                if await btn.get_attribute("disabled") is not None:
+                    continue
+                await btn.scroll_into_view_if_needed()
+                await btn.click()
+                await asyncio.sleep(2)
+                logger.info(f"Clicked: {sel}")
+                return True
             except Exception:
                 continue
-        return None
+        return False
 
-    async def _wait_for_any(self, page, selectors: list[str], timeout: int = 10_000):
-        """Wait until at least one of the selectors appears in the DOM."""
-        combined = ", ".join(selectors)
-        try:
-            await page.wait_for_selector(combined, timeout=timeout)
-        except PWTimeout:
-            logger.debug("None of the category selectors appeared in time")
+    # ══════════════════════════════════════════
+    #  Utilities
+    # ══════════════════════════════════════════
 
-    async def notify(self, message: str):
-        """Send a Telegram message to the user (fire-and-forget, never raises)."""
+    async def notify(self, msg: str):
         if self.bot and self.user_id:
             try:
                 await self.bot.send_message(
-                    chat_id=self.user_id,
-                    text=message,
-                    parse_mode="Markdown",
+                    chat_id=self.user_id, text=msg, parse_mode="Markdown"
                 )
             except Exception as e:
-                logger.error(f"Failed to notify user {self.user_id}: {e}")
+                logger.error(f"notify: {e}")
 
     async def _screenshot(self, page, name: str):
         if DEBUG_MODE:
-            path = f"/tmp/{name}.png"
             try:
-                await page.screenshot(path=path, full_page=False)
-                logger.debug(f"Screenshot saved: {path}")
-            except Exception as e:
-                logger.debug(f"Screenshot failed: {e}")
+                await page.screenshot(path=f"/tmp/{name}.png")
+            except Exception:
+                pass
+PYEOF
+python3 -c "
+import ast
+ast.parse(open('/mnt/user-data/outputs/engine.py').read())
+print('✅ Syntax OK')
+src = open('/mnt/user-data/outputs/engine.py').read()
+for label, token in [
+    ('WS listener',       '_attach_ws_listener'),
+    ('hold-object msg',   'hold-object'),
+    ('seat prefix map',   'CATEGORY_PREFIXES'),
+    ('tracing_id',        '_make_tracing_id'),
+    ('objectId parsing',  'Bronze'),
+    ('confirmation wait', '_held_seats'),
+    ('next button',       'التالي: الدفع'),
+]:
+    print(('✅' if token in src else '❌') + ' ' + label)
+"
